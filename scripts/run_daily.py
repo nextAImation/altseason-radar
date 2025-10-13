@@ -126,107 +126,114 @@ def parse_latest_md(reports_dir: Path) -> Dict[str, Any]:
 
 def load_summary(state_path: Path, reports_dir: Path) -> Dict[str, Any]:
     """
-    Load daily summary from state.json; if missing/incomplete,
-    parse the newest Markdown report in `reports_dir`.
+    Try state.json → fallback to newest Markdown (recursive).
+    Return dict with: total_score(int), status(str), forming(bool), as_of(str ISO).
     """
-    def _has_values(d: Dict[str, Any]) -> bool:
-        return (
-            isinstance(d, dict)
-            and d.get("total_score") not in (None, "", "N/A")
-            and isinstance(d.get("total_score"), (int, float))
-            and str(d.get("status", "")).strip() != ""
-        )
+    import re
+    from datetime import datetime, UTC
 
-    state: Dict[str, Any] = {}
-    # 1) سعی در خواندن state.json
+    def _has_values(d: Dict[str, Any]) -> bool:
+        try:
+            sc = d.get("total_score", None)
+            st = str(d.get("status", "")).strip()
+            return isinstance(sc, (int, float)) and st != ""
+        except Exception:
+            return False
+
+    # 1) state.json
+    data: Dict[str, Any] = {}
     if state_path.exists():
         try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-        except Exception:
-            state = {}
+            data = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            console.print(f"[yellow]Failed to read state.json: {e}[/yellow]")
 
-    # 2) اگر ناقص بود از Markdown پرش کن
-    needs_fallback = not _has_values(state)
+    if _has_values(data):
+        # make sure 'as_of' exists
+        data.setdefault("as_of", datetime.now(UTC).isoformat())
+        data.setdefault("forming", False)
+        return data
 
-    if needs_fallback:
-        # reports/*.md را پیدا کن
-        reports_dir.mkdir(parents=True, exist_ok=True)
-        md_files = sorted(reports_dir.glob("*.md"))
-        if md_files:
-            latest_md = md_files[-1]
+    # 2) newest *.md (recursive)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    md_files = sorted(reports_dir.rglob("*.md"))
+    if not md_files:
+        console.print("[yellow]No Markdown reports found under reports/**.md[/yellow]")
+    else:
+        latest_md = md_files[-1]
+        try:
             text = latest_md.read_text(encoding="utf-8")
-
-            import re
             score = None
             status = None
 
-            # امتیاز — چند الگو برای پوشش حالت‌های مختلف
+            # score patterns
             for pat in [
-                r"Total\s*Score:\s*(\d{1,3})\s*/\s*100",
-                r"\*\*Total\s*Score:\*\*\s*(\d{1,3})\s*/\s*100",
-                r"Final\s*Verdict:.*?(\d{1,3})\s*/\s*100",
+                r"\bTotal\s*Score\s*:\s*(\d{1,3})\s*/\s*100",
+                r"\bScore\s*:\s*(\d{1,3})\s*/\s*100",
+                r"\bFinal\s*Verdict.*?(\d{1,3})\s*/\s*100",
             ]:
                 m = re.search(pat, text, flags=re.IGNORECASE | re.DOTALL)
                 if m:
                     score = int(m.group(1))
                     break
 
-            # وضعیت — هم با عنوان Status هم با Final Verdict
+            # status patterns (strip emojis/pipes/dashes)
             for pat in [
-                r"Status:\s*([^\n\r]+)",
-                r"\*\*Status:\*\*\s*([^\n\r]+)",
-                r"Final\s*Verdict:\s*([^\n\r]+)",
+                r"\bStatus\s*:\s*([^\n\r]+)",
+                r"\bFinal\s*Verdict\s*:\s*([^\n\r]+)",
             ]:
                 m = re.search(pat, text, flags=re.IGNORECASE)
                 if m:
-                    status_raw = m.group(1).strip()
-                    # تمیز کردن ایموجی/بولت‌ها
-                    status = (
-                        status_raw.replace("🟢", "")
-                                  .replace("🟡", "")
-                                  .replace("🟠", "")
-                                  .replace("🔴", "")
-                                  .replace("⚪", "")
-                                  .replace("⚪️", "")
-                                  .strip(" -:|")
-                                  .strip()
+                    raw = m.group(1)
+                    clean = (
+                        raw.replace("🟢", "")
+                           .replace("🟡", "")
+                           .replace("🟠", "")
+                           .replace("🔴", "")
+                           .replace("⚪️", "")
+                           .replace("⚪", "")
+                           .strip(" -:|")
+                           .strip()
                     )
-                    # بعضی گزارش‌ها به شکل: "Neutral — 60/100"
-                    status = status.split("—")[0].strip()
+                    status = clean.split("—")[0].strip()
                     break
 
             if score is not None:
-                state["total_score"] = score
+                data["total_score"] = score
             if status:
-                state["status"] = status
+                data["status"] = status
 
-            # forming را از status استنتاج کن (اختیاری)
-            st_low = str(state.get("status", "")).lower()
+            st_low = str(data.get("status", "")).lower()
             if "form" in st_low or "watch" in st_low:
-                state["forming"] = True
+                data["forming"] = True
             elif "neutral" in st_low:
-                state["forming"] = False
+                data["forming"] = False
 
-            # زمان
-            if "as_of" not in state or not state["as_of"]:
-                # Generated یا تاریخ سربرگ را بخوان
-                ts = None
-                m = re.search(r"\*\*Generated:\*\*\s*([^\n\r]+)", text)
-                if m:
-                    ts = m.group(1).strip()
-                if ts:
-                    state["as_of"] = ts
-                else:
-                    from datetime import datetime, UTC
-                    state["as_of"] = datetime.now(UTC).isoformat()
+            # as_of
+            if "as_of" not in data or not data["as_of"]:
+                # try a “Generated:” line
+                g = re.search(r"\*\*Generated:\*\*\s*([^\n\r]+)", text)
+                data["as_of"] = (
+                    g.group(1).strip() if g else datetime.now(UTC).isoformat()
+                )
 
-    # تضمین وجود کلیدها
-    state.setdefault("forming", False)
-    if "as_of" not in state or not state["as_of"]:
-        from datetime import datetime, UTC
-        state["as_of"] = datetime.now(UTC).isoformat()
+        except Exception as e:
+            console.print(f"[yellow]Failed to parse {latest_md.name}: {e}[/yellow]")
 
-    return state
+    # 3) final guards
+    data.setdefault("total_score", None)
+    data.setdefault("status", "")
+    data.setdefault("forming", False)
+    data.setdefault("as_of", datetime.now(UTC).isoformat())
+
+    # اگر هنوز خالیه، برای دیباگ روی کنسول پیام بده
+    if not _has_values(data):
+        console.print(
+            "[yellow]Summary still incomplete (score/status missing). "
+            "Ensure state.json is written by the runner OR the Markdown includes 'Score:' and 'Status:' lines.[/yellow]"
+        )
+    return data
+
 
 
 # ----------------------------- message & telegram -----------------------------
