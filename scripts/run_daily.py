@@ -52,10 +52,26 @@ import requests  # after requirements install
 
 console: Console = Console()  # type: ignore
 
+DEFAULT_STATE: Dict[str, Any] = {
+    "history": [],
+    "total_score": None,
+    "status": "",
+    "forming": False,
+    "as_of": None,
+    "factors": {}
+}
+
+
+def ensure_state_file(state_path: Path) -> None:
+    """Create an empty/seed state.json if missing."""
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    if not state_path.exists():
+        state_path.write_text(json.dumps(DEFAULT_STATE, ensure_ascii=False, indent=2), encoding="utf-8")
+
 
 def read_state(state_path: Path) -> Dict[str, Any]:
-    if not state_path.exists():
-        raise FileNotFoundError(f"state file not found: {state_path}")
+    """Read state.json; if missing, create default first."""
+    ensure_state_file(state_path)
     with state_path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -73,7 +89,7 @@ def fmt_local(dt_iso: str, tz_name: str) -> str:
 def build_message(state: Dict[str, Any]) -> str:
     score = state.get("total_score")
     status = state.get("status") or "Unknown"
-    forming = state.get("forming", False)
+    forming = bool(state.get("forming"))
     dt_raw = state.get("as_of") or state.get("date") or datetime.utcnow().isoformat() + "Z"
     when = fmt_local(dt_raw, TZ_DISPLAY)
 
@@ -157,11 +173,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = make_parser().parse_args(argv)
 
     try:
+        # ✅ ensure state exists *before* running so downstream code never fails
+        state_path = Path(args.state)
+        ensure_state_file(state_path)
+
         ok = run_analysis()
         if not ok:
             return 1
 
-        state_path = Path(args.state)
         state = read_state(state_path)
         msg = build_message(state)
 
@@ -189,9 +208,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         console.print("[green]Daily analysis completed successfully![/green]")
         return 0
 
-    except FileNotFoundError as e:
-        console.print(f"[red]State file missing:[/red] {e}")
-        return 2
     except requests.RequestException as e:
         console.print(f"[red]Network/Telegram error:[/red] {e}")
         return 3
