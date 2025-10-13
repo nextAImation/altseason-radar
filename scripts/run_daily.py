@@ -126,29 +126,108 @@ def parse_latest_md(reports_dir: Path) -> Dict[str, Any]:
 
 def load_summary(state_path: Path, reports_dir: Path) -> Dict[str, Any]:
     """
-    Load summary primarily from state.json; if missing/empty fields, merge
-    with parsed values from the latest Markdown report.
+    Load daily summary from state.json; if missing/incomplete,
+    parse the newest Markdown report in `reports_dir`.
     """
-    state = read_state(state_path)
+    def _has_values(d: Dict[str, Any]) -> bool:
+        return (
+            isinstance(d, dict)
+            and d.get("total_score") not in (None, "", "N/A")
+            and isinstance(d.get("total_score"), (int, float))
+            and str(d.get("status", "")).strip() != ""
+        )
 
-    score = state.get("total_score")
-    status = state.get("status")
-    needs_fallback = (score is None) or (isinstance(status, str) and not status.strip())
+    state: Dict[str, Any] = {}
+    # 1) سعی در خواندن state.json
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            state = {}
+
+    # 2) اگر ناقص بود از Markdown پرش کن
+    needs_fallback = not _has_values(state)
 
     if needs_fallback:
-        md_state = parse_latest_md(reports_dir)
-        if md_state:
-            # Merge only meaningful values from md_state
-            for k, v in md_state.items():
-                if k not in state or state.get(k) in (None, "", {}):
-                    state[k] = v
+        # reports/*.md را پیدا کن
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        md_files = sorted(reports_dir.glob("*.md"))
+        if md_files:
+            latest_md = md_files[-1]
+            text = latest_md.read_text(encoding="utf-8")
 
-    # Ensure minimal keys exist
-    state.setdefault("factors", {})
-    state.setdefault("as_of", datetime.utcnow().isoformat() + "Z")
-    state.setdefault("forming", bool(state.get("status") and ("Form" in state["status"] or "Watch" in state["status"])))
+            import re
+            score = None
+            status = None
+
+            # امتیاز — چند الگو برای پوشش حالت‌های مختلف
+            for pat in [
+                r"Total\s*Score:\s*(\d{1,3})\s*/\s*100",
+                r"\*\*Total\s*Score:\*\*\s*(\d{1,3})\s*/\s*100",
+                r"Final\s*Verdict:.*?(\d{1,3})\s*/\s*100",
+            ]:
+                m = re.search(pat, text, flags=re.IGNORECASE | re.DOTALL)
+                if m:
+                    score = int(m.group(1))
+                    break
+
+            # وضعیت — هم با عنوان Status هم با Final Verdict
+            for pat in [
+                r"Status:\s*([^\n\r]+)",
+                r"\*\*Status:\*\*\s*([^\n\r]+)",
+                r"Final\s*Verdict:\s*([^\n\r]+)",
+            ]:
+                m = re.search(pat, text, flags=re.IGNORECASE)
+                if m:
+                    status_raw = m.group(1).strip()
+                    # تمیز کردن ایموجی/بولت‌ها
+                    status = (
+                        status_raw.replace("🟢", "")
+                                  .replace("🟡", "")
+                                  .replace("🟠", "")
+                                  .replace("🔴", "")
+                                  .replace("⚪", "")
+                                  .replace("⚪️", "")
+                                  .strip(" -:|")
+                                  .strip()
+                    )
+                    # بعضی گزارش‌ها به شکل: "Neutral — 60/100"
+                    status = status.split("—")[0].strip()
+                    break
+
+            if score is not None:
+                state["total_score"] = score
+            if status:
+                state["status"] = status
+
+            # forming را از status استنتاج کن (اختیاری)
+            st_low = str(state.get("status", "")).lower()
+            if "form" in st_low or "watch" in st_low:
+                state["forming"] = True
+            elif "neutral" in st_low:
+                state["forming"] = False
+
+            # زمان
+            if "as_of" not in state or not state["as_of"]:
+                # Generated یا تاریخ سربرگ را بخوان
+                ts = None
+                m = re.search(r"\*\*Generated:\*\*\s*([^\n\r]+)", text)
+                if m:
+                    ts = m.group(1).strip()
+                if ts:
+                    state["as_of"] = ts
+                else:
+                    from datetime import datetime, UTC
+                    state["as_of"] = datetime.now(UTC).isoformat()
+
+    # تضمین وجود کلیدها
+    state.setdefault("forming", False)
+    if "as_of" not in state or not state["as_of"]:
+        from datetime import datetime, UTC
+        state["as_of"] = datetime.now(UTC).isoformat()
 
     return state
+
 
 # ----------------------------- message & telegram -----------------------------
 
