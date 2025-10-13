@@ -1,0 +1,38 @@
+{
+  "date": "2025-10-13",
+  "timestamp": "2025-10-13T21:08:27.825320+00:00",
+  "total_score": 60,
+  "status": "Neutral",
+  "factors": {
+    "btc_dominance": {
+      "score": 10,
+      "ok": true,
+      "explain": "test"
+    },
+    "eth_btc": {
+      "score": 10,
+      "ok": true,
+      "explain": "test"
+    },
+    "total2": {
+      "score": 10,
+      "ok": true,
+      "explain": "test"
+    },
+    "total3": {
+      "score": 10,
+      "ok": true,
+      "explain": "test"
+    },
+    "btc_regime": {
+      "score": 10,
+      "ok": true,
+      "explain": "test"
+    },
+    "eth_trend": {
+      "score": 10,
+      "ok": true,
+      "explain": "test"
+    }
+  }
+}

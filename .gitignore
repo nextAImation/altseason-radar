@@ -1,0 +1,16 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.env
+.venv/
+.vscode/
+.idea/
+
+# Reports artifacts (فقط markdown نگه دار)
+reports/*.html
+reports/*.csv
+reports/*.json
