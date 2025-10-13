@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Altseason Radar — daily runner with Telegram notify and robust logging.
+
 Usage:
   python -m scripts.run_daily
   python -m scripts.run_daily --no-telegram
@@ -12,14 +13,15 @@ from __future__ import annotations
 
 import os
 import sys
+import re
 import json
 import argparse
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 from datetime import datetime
 from dateutil import tz
 
-# allow running as module: python -m scripts.run_daily
+# Allow "python -m scripts.run_daily"
 CURR = Path(__file__).resolve()
 ROOT = CURR.parent.parent
 SRC = ROOT / "src"
@@ -38,46 +40,43 @@ try:
     from rich.panel import Panel
     from rich.text import Text
 except Exception:
-    # Fallback if rich not available (should be installed via requirements)
-    class Dummy:
+    # Minimal fallback if 'rich' is unavailable
+    class _DummyConsole:
         def print(self, *a, **k):  # type: ignore
             print(*a)
         def rule(self, *a, **k):   # type: ignore
             print("-" * 60)
-    Console = Dummy  # type: ignore
+    Console = _DummyConsole  # type: ignore
     Panel = Text = Table = object  # type: ignore
 
-import requests  # after requirements install
-
+import requests  # After requirements install
 
 console: Console = Console()  # type: ignore
 
-DEFAULT_STATE: Dict[str, Any] = {
-    "history": [],
-    "total_score": None,
-    "status": "",
-    "forming": False,
-    "as_of": None,
-    "factors": {}
-}
+# ----------------------------- helpers: files & time -----------------------------
 
-
-def ensure_state_file(state_path: Path) -> None:
-    """Create an empty/seed state.json if missing."""
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    if not state_path.exists():
-        state_path.write_text(json.dumps(DEFAULT_STATE, ensure_ascii=False, indent=2), encoding="utf-8")
+def ensure_state_file(path: Path) -> None:
+    """Create a minimal state.json if it doesn't exist (prevents hard failure)."""
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    minimal = {
+        "total_score": None,
+        "status": "",
+        "forming": False,
+        "as_of": datetime.utcnow().isoformat() + "Z",
+        "factors": {},
+    }
+    path.write_text(json.dumps(minimal, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def read_state(state_path: Path) -> Dict[str, Any]:
-    """Read state.json; if missing, create default first."""
-    ensure_state_file(state_path)
     with state_path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def fmt_local(dt_iso: str, tz_name: str) -> str:
-    """Format ISO datetime string to display timezone."""
+    """Format ISO datetime string to display timezone for human-friendly message."""
     try:
         dt = datetime.fromisoformat(dt_iso.replace("Z", "+00:00"))
         to_zone = tz.gettz(tz_name or "UTC")
@@ -85,6 +84,73 @@ def fmt_local(dt_iso: str, tz_name: str) -> str:
     except Exception:
         return dt_iso
 
+# ----------------------------- fallback: parse latest md -----------------------------
+
+MD_SCORE_RE = re.compile(r"(?i)Total\s*Score\s*:\s*(\d+)\s*/\s*100")
+MD_STATUS_RE = re.compile(r"(?i)Status\s*:\s*([^\n]+)")
+
+def parse_latest_md(reports_dir: Path) -> Dict[str, Any]:
+    """Parse the most recent Markdown report to extract score/status as a fallback."""
+    md_files: List[Path] = sorted(
+        reports_dir.glob("*.md"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
+    if not md_files:
+        return {}
+
+    text = md_files[0].read_text(encoding="utf-8", errors="ignore")
+    score: Optional[int] = None
+    status: Optional[str] = None
+
+    m = MD_SCORE_RE.search(text)
+    if m:
+        try:
+            score = int(m.group(1))
+        except Exception:
+            pass
+
+    m = MD_STATUS_RE.search(text)
+    if m:
+        # Example line: "Forming / Watch 🟡"
+        status = m.group(1).strip()
+
+    return {
+        "total_score": score,
+        "status": status,
+        "forming": bool(status and ("Form" in status or "Watch" in status)),
+        "as_of": datetime.utcnow().isoformat() + "Z",
+        "factors": {},
+    }
+
+
+def load_summary(state_path: Path, reports_dir: Path) -> Dict[str, Any]:
+    """
+    Load summary primarily from state.json; if missing/empty fields, merge
+    with parsed values from the latest Markdown report.
+    """
+    state = read_state(state_path)
+
+    score = state.get("total_score")
+    status = state.get("status")
+    needs_fallback = (score is None) or (isinstance(status, str) and not status.strip())
+
+    if needs_fallback:
+        md_state = parse_latest_md(reports_dir)
+        if md_state:
+            # Merge only meaningful values from md_state
+            for k, v in md_state.items():
+                if k not in state or state.get(k) in (None, "", {}):
+                    state[k] = v
+
+    # Ensure minimal keys exist
+    state.setdefault("factors", {})
+    state.setdefault("as_of", datetime.utcnow().isoformat() + "Z")
+    state.setdefault("forming", bool(state.get("status") and ("Form" in state["status"] or "Watch" in state["status"])))
+
+    return state
+
+# ----------------------------- message & telegram -----------------------------
 
 def build_message(state: Dict[str, Any]) -> str:
     score = state.get("total_score")
@@ -96,20 +162,23 @@ def build_message(state: Dict[str, Any]) -> str:
     parts = [
         "📡 *Altseason Radar — Daily*",
         f"📊 *Score:* `{score}/100`" if score is not None else "📊 *Score:* `N/A`",
-        f"🎯 *Status:* {status} {'🟢' if forming else '🟡' if 'Form' in status else '⚪️'}",
+        f"🎯 *Status:* {status} {'🟢' if forming else '🟡' if 'Form' in status or 'Watch' in status else '⚪️'}",
         f"🕒 *As of:* {when}",
     ]
 
-    # Optional: top factor snippets if present
+    # Optional factor bullets (kept short for Telegram)
     facs: Dict[str, Any] = state.get("factors") or {}
     if facs:
         top = []
         for key, val in facs.items():
-            sc = val.get("score")
-            ok = "✅" if val.get("ok") else "❌"
-            top.append(f"• {key}: {sc} {ok}")
+            try:
+                sc = val.get("score")
+                ok = "✅" if val.get("ok") else "❌"
+                top.append(f"• {key}: {sc} {ok}")
+            except Exception:
+                pass
         if top:
-            parts.append("—\n*Factors*\n" + "\n".join(top[:8]))  # cap to 8 for brevity
+            parts.append("—\n*Factors*\n" + "\n".join(top[:8]))  # cap to 8 lines
 
     return "\n".join(parts)
 
@@ -134,6 +203,7 @@ def send_telegram(text: str) -> Optional[Dict[str, Any]]:
         raise RuntimeError(f"Telegram API error: {r.status_code} {r.text}")
     return r.json()
 
+# ----------------------------- runner -----------------------------
 
 def run_analysis() -> bool:
     console.rule("[bold cyan]Altseason Radar — Daily Run")
@@ -148,7 +218,7 @@ def run_analysis() -> bool:
 
 
 def make_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Run daily analysis and notify Telegram.")
+    p = argparse.ArgumentParser(description="Run daily analysis and optionally notify Telegram.")
     p.add_argument(
         "--no-telegram",
         action="store_true",
@@ -164,34 +234,39 @@ def make_parser() -> argparse.ArgumentParser:
         "--reports",
         type=str,
         default=str(ROOT / "reports"),
-        help="Reports directory (for future extensions).",
+        help="Reports directory (for Markdown fallback parsing).",
     )
     return p
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     args = make_parser().parse_args(argv)
 
+    state_path = Path(args.state)
+    reports_dir = Path(args.reports)
+
     try:
-        # ✅ ensure state exists *before* running so downstream code never fails
-        state_path = Path(args.state)
+        # Make sure state file exists so the next steps never hard-fail
         ensure_state_file(state_path)
 
         ok = run_analysis()
         if not ok:
             return 1
 
-        state = read_state(state_path)
+        # Load summary with Markdown fallback when state.json is empty/partial
+        state = load_summary(state_path, reports_dir)
         msg = build_message(state)
 
-        # Console summary
+        # Console table (best-effort; if rich not present, it will just print text)
         try:
             table = Table(title="Daily Summary")
             table.add_column("Field", style="bold")
             table.add_column("Value")
             table.add_row("Score", f"{state.get('total_score', 'N/A')}")
-            table.add_row("Status", state.get("status", "Unknown"))
+            table.add_row("Status", state.get("status", "Unknown") or "Unknown")
             table.add_row("Forming", "Yes" if state.get("forming") else "No")
+            when = fmt_local(state.get("as_of") or "", TZ_DISPLAY)
+            table.add_row("As of", when or "-")
             console.print(table)
         except Exception:
             console.print(msg)
@@ -200,7 +275,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             console.print("[yellow]Skipping Telegram by flag.[/yellow]")
             return 0
 
-        # Send Telegram
         console.print("📨 Sending Telegram notification…")
         _res = send_telegram(msg)
         console.print("✅ Telegram notification sent.")
