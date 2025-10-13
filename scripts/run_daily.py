@@ -238,56 +238,72 @@ def load_summary(state_path: Path, reports_dir: Path) -> Dict[str, Any]:
 
 # ----------------------------- message & telegram -----------------------------
 
+# --- replace existing build_message with this version ---
+
+FACTOR_TITLES = {
+    "btc_dominance": "BTC Dominance",
+    "eth_btc": "ETH/BTC",
+    "total2": "TOTAL2 (Alts ex-BTC)",
+    "total3": "TOTAL3 (Smaller Alts)",
+    "btc_regime": "BTC Regime",
+    "eth_trend": "ETH Trend",
+}
+
+DISPLAY_ORDER = [
+    "btc_dominance",
+    "eth_btc",
+    "total2",
+    "total3",
+    "btc_regime",
+    "eth_trend",
+]
+
+def _status_emoji(status: str, forming: bool) -> str:
+    s = (status or "").lower()
+    if "altseason likely" in s:
+        return "🟢"
+    if "forming" in s or forming:
+        return "🟡"
+    if "neutral" in s:
+        return "⚪️"
+    if "risk-off" in s or "risk off" in s:
+        return "🔴"
+    return "❔"
+
 def build_message(state: Dict[str, Any]) -> str:
     score = state.get("total_score")
     status = state.get("status") or "Unknown"
     forming = bool(state.get("forming"))
-    dt_raw = state.get("as_of") or state.get("date") or datetime.utcnow().isoformat() + "Z"
+    dt_raw = state.get("as_of") or state.get("date") or datetime.now(datetime.UTC).isoformat()
     when = fmt_local(dt_raw, TZ_DISPLAY)
+
+    # single, correct emoji
+    emoji = _status_emoji(status, forming)
 
     parts = [
         "📡 *Altseason Radar — Daily*",
         f"📊 *Score:* `{score}/100`" if score is not None else "📊 *Score:* `N/A`",
-        f"🎯 *Status:* {status} {'🟢' if forming else '🟡' if 'Form' in status or 'Watch' in status else '⚪️'}",
+        f"🎯 *Status:* {status} {emoji}",
         f"🕒 *As of:* {when}",
     ]
 
-    # Optional factor bullets (kept short for Telegram)
+    # Factors (nice titles, fixed order, cap to 6)
     facs: Dict[str, Any] = state.get("factors") or {}
     if facs:
-        top = []
-        for key, val in facs.items():
-            try:
-                sc = val.get("score")
-                ok = "✅" if val.get("ok") else "❌"
-                top.append(f"• {key}: {sc} {ok}")
-            except Exception:
-                pass
-        if top:
-            parts.append("—\n*Factors*\n" + "\n".join(top[:8]))  # cap to 8 lines
+        lines = []
+        # keep our desired order but include any extra keys at the end
+        ordered_keys = [k for k in DISPLAY_ORDER if k in facs] + [k for k in facs.keys() if k not in DISPLAY_ORDER]
+        for k in ordered_keys[:6]:
+            v = facs.get(k, {})
+            sc = v.get("score", "—")
+            ok = "✅" if v.get("ok") else "❌"
+            title = FACTOR_TITLES.get(k, k.replace("_", " ").title())
+            lines.append(f"• {title}: {sc} {ok}")
+        if lines:
+            parts.append("—\n*Factors*\n" + "\n".join(lines))
 
     return "\n".join(parts)
 
-
-def send_telegram(text: str) -> Optional[Dict[str, Any]]:
-    token = os.getenv("TELEGRAM_BOT_TOKEN") or get_telegram_token()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID") or get_telegram_chat_id()
-
-    if not token or not chat_id:
-        console.print("[yellow]Telegram not configured (missing token/chat_id). Skipping.[/yellow]")
-        return None
-
-    api = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True,
-    }
-    r = requests.post(api, json=payload, timeout=15)
-    if r.status_code != 200:
-        raise RuntimeError(f"Telegram API error: {r.status_code} {r.text}")
-    return r.json()
 
 # ----------------------------- runner -----------------------------
 
