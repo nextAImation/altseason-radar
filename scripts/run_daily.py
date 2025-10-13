@@ -18,7 +18,7 @@ import json
 import argparse
 from pathlib import Path
 from typing import Any, Dict, Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
 from dateutil import tz
 
 # Allow "python -m scripts.run_daily"
@@ -37,9 +37,7 @@ from altseason.config import (                 # noqa: E402
 try:
     from rich.console import Console
     from rich.table import Table
-    from rich.panel import Panel
-    from rich.text import Text
-except Exception:
+except Exception:  # pragma: no cover
     # Minimal fallback if 'rich' is unavailable
     class _DummyConsole:
         def print(self, *a, **k):  # type: ignore
@@ -47,32 +45,22 @@ except Exception:
         def rule(self, *a, **k):   # type: ignore
             print("-" * 60)
     Console = _DummyConsole  # type: ignore
-    Panel = Text = Table = object  # type: ignore
+    class _DummyTable:
+        def __init__(self, *_, **__): pass
+        def add_column(self, *_, **__): pass
+        def add_row(self, *a, **k): pass
+    Table = _DummyTable  # type: ignore
 
 import requests  # After requirements install
 
 console: Console = Console()  # type: ignore
 
-# ----------------------------- helpers: files & time -----------------------------
 
-def ensure_state_file(path: Path) -> None:
-    """Create a minimal state.json if it doesn't exist (prevents hard failure)."""
-    if path.exists():
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    minimal = {
-        "total_score": None,
-        "status": "",
-        "forming": False,
-        "as_of": datetime.utcnow().isoformat() + "Z",
-        "factors": {},
-    }
-    path.write_text(json.dumps(minimal, ensure_ascii=False, indent=2), encoding="utf-8")
+# ----------------------------- small time helpers -----------------------------
 
-
-def read_state(state_path: Path) -> Dict[str, Any]:
-    with state_path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+def iso_utc_now() -> str:
+    """Return ISO-8601 in UTC with 'Z' suffix."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def fmt_local(dt_iso: str, tz_name: str) -> str:
@@ -84,7 +72,30 @@ def fmt_local(dt_iso: str, tz_name: str) -> str:
     except Exception:
         return dt_iso
 
-# ----------------------------- fallback: parse latest md -----------------------------
+
+# ----------------------------- files & state ----------------------------------
+
+def ensure_state_file(path: Path) -> None:
+    """Create a minimal state.json if it doesn't exist (prevents hard failure)."""
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    minimal = {
+        "total_score": None,
+        "status": "",
+        "forming": False,
+        "as_of": iso_utc_now(),
+        "factors": {},
+    }
+    path.write_text(json.dumps(minimal, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def read_state(state_path: Path) -> Dict[str, Any]:
+    with state_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ----------------------------- fallback: parse latest md ----------------------
 
 MD_SCORE_RE = re.compile(r"(?i)Total\s*Score\s*:\s*(\d+)\s*/\s*100")
 MD_STATUS_RE = re.compile(r"(?i)Status\s*:\s*([^\n]+)")
@@ -112,14 +123,13 @@ def parse_latest_md(reports_dir: Path) -> Dict[str, Any]:
 
     m = MD_STATUS_RE.search(text)
     if m:
-        # Example line: "Forming / Watch 🟡"
         status = m.group(1).strip()
 
     return {
         "total_score": score,
         "status": status,
         "forming": bool(status and ("Form" in status or "Watch" in status)),
-        "as_of": datetime.utcnow().isoformat() + "Z",
+        "as_of": iso_utc_now(),
         "factors": {},
     }
 
@@ -129,9 +139,6 @@ def load_summary(state_path: Path, reports_dir: Path) -> Dict[str, Any]:
     Try state.json → fallback to newest Markdown (recursive).
     Return dict with: total_score(int), status(str), forming(bool), as_of(str ISO).
     """
-    import re
-    from datetime import datetime, UTC
-
     def _has_values(d: Dict[str, Any]) -> bool:
         try:
             sc = d.get("total_score", None)
@@ -149,8 +156,7 @@ def load_summary(state_path: Path, reports_dir: Path) -> Dict[str, Any]:
             console.print(f"[yellow]Failed to read state.json: {e}[/yellow]")
 
     if _has_values(data):
-        # make sure 'as_of' exists
-        data.setdefault("as_of", datetime.now(UTC).isoformat())
+        data.setdefault("as_of", iso_utc_now())
         data.setdefault("forming", False)
         return data
 
@@ -209,13 +215,8 @@ def load_summary(state_path: Path, reports_dir: Path) -> Dict[str, Any]:
             elif "neutral" in st_low:
                 data["forming"] = False
 
-            # as_of
             if "as_of" not in data or not data["as_of"]:
-                # try a “Generated:” line
-                g = re.search(r"\*\*Generated:\*\*\s*([^\n\r]+)", text)
-                data["as_of"] = (
-                    g.group(1).strip() if g else datetime.now(UTC).isoformat()
-                )
+                data["as_of"] = iso_utc_now()
 
         except Exception as e:
             console.print(f"[yellow]Failed to parse {latest_md.name}: {e}[/yellow]")
@@ -224,9 +225,8 @@ def load_summary(state_path: Path, reports_dir: Path) -> Dict[str, Any]:
     data.setdefault("total_score", None)
     data.setdefault("status", "")
     data.setdefault("forming", False)
-    data.setdefault("as_of", datetime.now(UTC).isoformat())
+    data.setdefault("as_of", iso_utc_now())
 
-    # اگر هنوز خالیه، برای دیباگ روی کنسول پیام بده
     if not _has_values(data):
         console.print(
             "[yellow]Summary still incomplete (score/status missing). "
@@ -235,10 +235,7 @@ def load_summary(state_path: Path, reports_dir: Path) -> Dict[str, Any]:
     return data
 
 
-
 # ----------------------------- message & telegram -----------------------------
-
-# --- replace existing build_message with this version ---
 
 FACTOR_TITLES = {
     "btc_dominance": "BTC Dominance",
@@ -270,11 +267,12 @@ def _status_emoji(status: str, forming: bool) -> str:
         return "🔴"
     return "❔"
 
+
 def build_message(state: Dict[str, Any]) -> str:
     score = state.get("total_score")
     status = state.get("status") or "Unknown"
     forming = bool(state.get("forming"))
-    dt_raw = state.get("as_of") or state.get("date") or datetime.now(datetime.UTC).isoformat()
+    dt_raw = state.get("as_of") or state.get("date") or iso_utc_now()
     when = fmt_local(dt_raw, TZ_DISPLAY)
 
     # single, correct emoji
@@ -291,7 +289,6 @@ def build_message(state: Dict[str, Any]) -> str:
     facs: Dict[str, Any] = state.get("factors") or {}
     if facs:
         lines = []
-        # keep our desired order but include any extra keys at the end
         ordered_keys = [k for k in DISPLAY_ORDER if k in facs] + [k for k in facs.keys() if k not in DISPLAY_ORDER]
         for k in ordered_keys[:6]:
             v = facs.get(k, {})
@@ -305,7 +302,29 @@ def build_message(state: Dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-# ----------------------------- runner -----------------------------
+def send_telegram(text: str) -> Optional[Dict[str, Any]]:
+    """Send a Markdown message to Telegram using env or config getters."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN") or get_telegram_token()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID") or get_telegram_chat_id()
+
+    if not token or not chat_id:
+        console.print("[yellow]Telegram not configured (missing token/chat_id). Skipping.[/yellow]")
+        return None
+
+    api = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
+    r = requests.post(api, json=payload, timeout=15)
+    if r.status_code != 200:
+        raise RuntimeError(f"Telegram API error: {r.status_code} {r.text}")
+    return r.json()
+
+
+# ----------------------------- runner ----------------------------------------
 
 def run_analysis() -> bool:
     console.rule("[bold cyan]Altseason Radar — Daily Run")
@@ -359,7 +378,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         state = load_summary(state_path, reports_dir)
         msg = build_message(state)
 
-        # Console table (best-effort; if rich not present, it will just print text)
+        # Console table
         try:
             table = Table(title="Daily Summary")
             table.add_column("Field", style="bold")
