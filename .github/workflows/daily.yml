@@ -1,29 +1,37 @@
+# .github/workflows/daily.yml
 name: Daily Altseason Analysis
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '0 6 * * *'  # زمان دلخواهت UTC
+    - cron: "0 6 * * *"   # هر روز 06:00 UTC
+  workflow_dispatch:
 
 jobs:
   analyze:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-
+          python-version: "3.12"
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Telegram smoke test
+        if: ${{ always() }}   # می‌تونی موقتاً برداری بعد از اطمینان
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="Smoke test from GitHub Actions ✅" \
+            -d disable_web_page_preview=true \
+            -d parse_mode=Markdown
 
       - name: Run daily analysis
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_ENABLED: ${{ secrets.TELEGRAM_ENABLED }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_ENABLED:   ${{ secrets.TELEGRAM_ENABLED }}
         run: python -m scripts.run_daily
