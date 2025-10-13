@@ -1,24 +1,204 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Daily runner script for Altseason Radar
+Altseason Radar — daily runner with Telegram notify and robust logging.
+Usage:
+  python -m scripts.run_daily
+  python -m scripts.run_daily --no-telegram
+  python -m scripts.run_daily --state ./reports/state.json --reports ./reports
 """
-import sys
+
+from __future__ import annotations
+
 import os
+import sys
+import json
+import argparse
+from pathlib import Path
+from typing import Any, Dict, Optional
+from datetime import datetime
+from dateutil import tz
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+# allow running as module: python -m scripts.run_daily
+CURR = Path(__file__).resolve()
+ROOT = CURR.parent.parent
+SRC = ROOT / "src"
+sys.path.insert(0, str(SRC))
 
-from altseason.runner import AltseasonRunner
+from altseason.runner import AltseasonRunner  # noqa: E402
+from altseason.config import (                 # noqa: E402
+    get_telegram_token,
+    get_telegram_chat_id,
+    TZ_DISPLAY,
+)
 
-def main():
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+except Exception:
+    # Fallback if rich not available (should be installed via requirements)
+    class Dummy:
+        def print(self, *a, **k):  # type: ignore
+            print(*a)
+        def rule(self, *a, **k):   # type: ignore
+            print("-" * 60)
+    Console = Dummy  # type: ignore
+    Panel = Text = Table = object  # type: ignore
+
+import requests  # after requirements install
+
+
+console: Console = Console()  # type: ignore
+
+
+def read_state(state_path: Path) -> Dict[str, Any]:
+    if not state_path.exists():
+        raise FileNotFoundError(f"state file not found: {state_path}")
+    with state_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def fmt_local(dt_iso: str, tz_name: str) -> str:
+    """Format ISO datetime string to display timezone."""
+    try:
+        dt = datetime.fromisoformat(dt_iso.replace("Z", "+00:00"))
+        to_zone = tz.gettz(tz_name or "UTC")
+        return dt.astimezone(to_zone).strftime("%Y-%m-%d %H:%M %Z")
+    except Exception:
+        return dt_iso
+
+
+def build_message(state: Dict[str, Any]) -> str:
+    score = state.get("total_score")
+    status = state.get("status") or "Unknown"
+    forming = state.get("forming", False)
+    dt_raw = state.get("as_of") or state.get("date") or datetime.utcnow().isoformat() + "Z"
+    when = fmt_local(dt_raw, TZ_DISPLAY)
+
+    parts = [
+        "📡 *Altseason Radar — Daily*",
+        f"📊 *Score:* `{score}/100`" if score is not None else "📊 *Score:* `N/A`",
+        f"🎯 *Status:* {status} {'🟢' if forming else '🟡' if 'Form' in status else '⚪️'}",
+        f"🕒 *As of:* {when}",
+    ]
+
+    # Optional: top factor snippets if present
+    facs: Dict[str, Any] = state.get("factors") or {}
+    if facs:
+        top = []
+        for key, val in facs.items():
+            sc = val.get("score")
+            ok = "✅" if val.get("ok") else "❌"
+            top.append(f"• {key}: {sc} {ok}")
+        if top:
+            parts.append("—\n*Factors*\n" + "\n".join(top[:8]))  # cap to 8 for brevity
+
+    return "\n".join(parts)
+
+
+def send_telegram(text: str) -> Optional[Dict[str, Any]]:
+    token = os.getenv("TELEGRAM_BOT_TOKEN") or get_telegram_token()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID") or get_telegram_chat_id()
+
+    if not token or not chat_id:
+        console.print("[yellow]Telegram not configured (missing token/chat_id). Skipping.[/yellow]")
+        return None
+
+    api = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
+    r = requests.post(api, json=payload, timeout=15)
+    if r.status_code != 200:
+        raise RuntimeError(f"Telegram API error: {r.status_code} {r.text}")
+    return r.json()
+
+
+def run_analysis() -> bool:
+    console.rule("[bold cyan]Altseason Radar — Daily Run")
+    console.print("🔄 Starting altseason analysis...")
     runner = AltseasonRunner()
-    success = runner.run_daily_analysis()
-    
-    if not success:
-        print("Daily analysis failed!")
-        sys.exit(1)
-    
-    print("Daily analysis completed successfully!")
-    sys.exit(0)
+    ok = runner.run_daily_analysis()
+    if ok:
+        console.print("✅ Analysis completed successfully!")
+    else:
+        console.print("[red]❌ Analysis failed[/red]")
+    return ok
+
+
+def make_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Run daily analysis and notify Telegram.")
+    p.add_argument(
+        "--no-telegram",
+        action="store_true",
+        help="Do not send Telegram notification even if analysis succeeds.",
+    )
+    p.add_argument(
+        "--state",
+        type=str,
+        default=str(ROOT / "reports" / "state.json"),
+        help="Path to state.json generated by analysis.",
+    )
+    p.add_argument(
+        "--reports",
+        type=str,
+        default=str(ROOT / "reports"),
+        help="Reports directory (for future extensions).",
+    )
+    return p
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = make_parser().parse_args(argv)
+
+    try:
+        ok = run_analysis()
+        if not ok:
+            return 1
+
+        state_path = Path(args.state)
+        state = read_state(state_path)
+        msg = build_message(state)
+
+        # Console summary
+        try:
+            table = Table(title="Daily Summary")
+            table.add_column("Field", style="bold")
+            table.add_column("Value")
+            table.add_row("Score", f"{state.get('total_score', 'N/A')}")
+            table.add_row("Status", state.get("status", "Unknown"))
+            table.add_row("Forming", "Yes" if state.get("forming") else "No")
+            console.print(table)
+        except Exception:
+            console.print(msg)
+
+        if args.no_telegram:
+            console.print("[yellow]Skipping Telegram by flag.[/yellow]")
+            return 0
+
+        # Send Telegram
+        console.print("📨 Sending Telegram notification…")
+        _res = send_telegram(msg)
+        console.print("✅ Telegram notification sent.")
+
+        console.print("[green]Daily analysis completed successfully![/green]")
+        return 0
+
+    except FileNotFoundError as e:
+        console.print(f"[red]State file missing:[/red] {e}")
+        return 2
+    except requests.RequestException as e:
+        console.print(f"[red]Network/Telegram error:[/red] {e}")
+        return 3
+    except Exception as e:
+        console.print(f"[red]Unexpected error:[/red] {e}")
+        return 9
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
