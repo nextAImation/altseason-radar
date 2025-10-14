@@ -1,315 +1,316 @@
-# src/altseason/factors.py
+# -*- coding: utf-8 -*-
+"""
+FactorCalculator with robust Binance -> CoinGecko fallback.
+Returns factor dict: {name: {score: float, ok: bool, explain: str}}
+"""
+
 from __future__ import annotations
 
 import math
-from datetime import datetime, UTC
-from pathlib import Path
-from typing import Dict, Any, Tuple, Optional, List
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Dict, Tuple, Optional
 
+import numpy as np
+import pandas as pd
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import pandas as pd
-import numpy as np
 
-from altseason.config import (
+from .config import (
     BINANCE_BASE,
     COINGECKO_BASE,
     THRESHOLDS,
     FACTOR_WEIGHTS,
 )
 
-# ---------- HTTP session with headers ----------
-def _session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "altseason-radar/1.0 (+github-actions)",
-        "Accept": "application/json",
-        "Connection": "keep-alive",
-    })
-    return s
+# --------------------------- Utilities ---------------------------
 
-_SES = _session()
+@dataclass
+class SeriesWithSource:
+    close: pd.Series
+    source: str  # "binance" | "coingecko"
 
-# ---------- Tech utils ----------
-def _ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = (delta.clip(lower=0)).rolling(period).mean()
-    loss = (-delta.clip(upper=0)).rolling(period).mean()
-    rs = gain / (loss.replace(0, np.nan))
+def _nznorm(x: float, lo: float, hi: float) -> float:
+    """Normalize x to [0,1] between lo..hi with clipping."""
+    if hi == lo:
+        return 0.0
+    return float(np.clip((x - lo) / (hi - lo), 0.0, 1.0))
+
+def _ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False, min_periods=max(2, n//2)).mean()
+
+def _rsi(s: pd.Series, n: int = 14) -> pd.Series:
+    delta = s.diff()
+    up = delta.clip(lower=0.0)
+    down = (-delta).clip(lower=0.0)
+    roll_up = up.ewm(alpha=1/n, adjust=False).mean()
+    roll_down = down.ewm(alpha=1/n, adjust=False).mean()
+    rs = roll_up / (roll_down.replace(0, np.nan))
     rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
+    return rsi.fillna(50.0)
 
-def _slope(series: pd.Series, lookback: int) -> float:
-    if len(series) < lookback:
+def _slope_pct(s: pd.Series, window: int = 50) -> float:
+    """Approx daily slope (%) over last `window`: (last-first)/first * 100 / window."""
+    if len(s) < window + 1:
         return 0.0
-    y = series[-lookback:].values.astype(float)
-    x = np.arange(len(y), dtype=float)
-    x = x - x.mean()
-    y = y - y.mean()
-    denom = (x**2).sum()
-    if denom == 0:
+    seg = s.iloc[-window:]
+    a, b = float(seg.iloc[0]), float(seg.iloc[-1])
+    if a == 0:
         return 0.0
-    return float((x * y).sum() / denom)
+    return ((b - a) / a) * 100.0 / max(1, window)
 
-# ---------- Robust fetch (with host failover + retry) ----------
-_BINANCE_HOSTS = [
-    # primary from config:
-    BINANCE_BASE.rstrip("/"),
-    # fallbacks:
-    "https://api1.binance.com/api/v3",
-    "https://api2.binance.com/api/v3",
-    "https://api3.binance.com/api/v3",
-]
+# --------------------------- HTTP helpers ---------------------------
 
-class FetchError(RuntimeError):
+class _HttpErr(RuntimeError):
     pass
 
 @retry(
     reraise=True,
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=0.8, min=0.8, max=6),
-    retry=retry_if_exception_type((requests.RequestException, FetchError)),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type(_HttpErr),
 )
-def _binance_klines(symbol: str, interval: str = "1d", limit: int = 400) -> pd.DataFrame:
-    last_exc: Optional[Exception] = None
-    for base in _BINANCE_HOSTS:
-        try:
-            url = f"{base}/klines"
-            params = {"symbol": symbol, "interval": interval, "limit": limit}
-            r = _SES.get(url, params=params, timeout=20)
-            if r.status_code >= 500:
-                # server error → retry
-                raise FetchError(f"binance 5xx {r.status_code}")
-            r.raise_for_status()
-            data = r.json()
-            cols = [
-                "open_time","open","high","low","close","volume","close_time","qav",
-                "trades","taker_base","taker_quote","ignore"
-            ]
-            df = pd.DataFrame(data, columns=cols)
-            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-            df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-            for c in ("open","high","low","close","volume"):
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-            if df["close"].dropna().empty:
-                raise FetchError("empty klines")
-            return df
-        except Exception as e:
-            last_exc = e
-            continue
-    raise FetchError(f"binance failover exhausted: {last_exc}")
-
-@retry(
-    reraise=True,
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=0.8, min=0.8, max=6),
-    retry=retry_if_exception_type((requests.RequestException, FetchError)),
-)
-def _coingecko_global() -> dict:
-    url = f"{COINGECKO_BASE}/global"
-    r = _SES.get(url, timeout=20)
-    if r.status_code >= 500:
-        raise FetchError(f"coingecko 5xx {r.status_code}")
-    r.raise_for_status()
-    return r.json().get("data", {})
-
-# Simple fallback when global fails (less rate-limited)
-def _coingecko_simple_price(ids: List[str], vs: str = "usd") -> dict:
+def _get_json(url: str, params: Optional[dict] = None, timeout: int = 25) -> dict:
     try:
-        url = f"{COINGECKO_BASE}/simple/price"
-        r = _SES.get(url, params={"ids": ",".join(ids), "vs_currencies": vs}, timeout=15)
-        r.raise_for_status()
+        r = requests.get(url, params=params, timeout=timeout)
+        if r.status_code >= 400:
+            raise _HttpErr(f"HTTP {r.status_code}: {r.text[:200]}")
         return r.json()
-    except Exception:
-        return {}
+    except requests.RequestException as e:
+        raise _HttpErr(str(e))
 
-# ---------- Scoring helpers ----------
-def _score_trend_with_ema(close: pd.Series, short: int, long: int, weight: int) -> Tuple[float, bool, dict]:
-    ema_s = _ema(close, short)
-    ema_l = _ema(close, long)
-    above = close.iloc[-1] > ema_s.iloc[-1] > ema_l.iloc[-1]
-    if above:
-        return float(weight), True, {"ema_s": float(ema_s.iloc[-1]), "ema_l": float(ema_l.iloc[-1])}
-    elif close.iloc[-1] > ema_s.iloc[-1]:
-        return float(weight) * 0.6, True, {"ema_s": float(ema_s.iloc[-1]), "ema_l": float(ema_l.iloc[-1])}
-    else:
-        return 0.0, False, {"ema_s": float(ema_s.iloc[-1]), "ema_l": float(ema_l.iloc[-1])}
+# --------------------------- Fetch: Binance & CoinGecko ---------------------------
 
-# ---------- Last-state fallback ----------
-def _load_prev_state() -> dict:
-    root = Path(__file__).resolve().parents[2]
-    state_path = root / "reports" / "state.json"
+def _binance_klines(symbol: str, interval: str = "1d", limit: int = 400) -> pd.Series:
+    """Fetch close series (UTC index) from Binance; raises on failure."""
+    url = f"{BINANCE_BASE}/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    js = _get_json(url, params=params)
+    # Kline: [ open_time, open, high, low, close, volume, close_time, ... ]
+    if not isinstance(js, list) or not js:
+        raise _HttpErr("Empty klines")
+    df = pd.DataFrame(
+        js,
+        columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "qav", "trades", "taker_base", "taker_quote", "ignore",
+        ],
+    )
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    ser = df.set_index("close_time")["close"].sort_index().dropna()
+    if ser.empty:
+        raise _HttpErr("No close data")
+    return ser
+
+def _cg_market_chart(coin_id: str, days: int = 400, vs: str = "usd") -> pd.Series:
+    """Close series from CoinGecko market_chart (ts, price)."""
+    url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart"
+    params = {"vs_currency": vs, "days": str(days), "interval": "daily", "precision": "full"}
+    js = _get_json(url, params=params, timeout=30)
+    prices = js.get("prices") or []
+    if not prices:
+        raise _HttpErr("No prices in market_chart")
+    df = pd.DataFrame(prices, columns=["ts", "close"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    ser = df.set_index("ts")["close"].sort_index().astype(float)
+    if ser.empty:
+        raise _HttpErr("Empty series from market_chart")
+    return ser
+
+_CG_ID = {
+    "BTCUSDT": "bitcoin",
+    "ETHUSDT": "ethereum",
+    "BNBUSDT": "binancecoin",
+    # نیاز شد اضافه کنین
+}
+
+def _series(symbol: str, limit: int = 400) -> SeriesWithSource:
+    """Get close series with fallback & its source label."""
+    # Primary: Binance
     try:
-        if state_path.exists():
-            return json.loads(state_path.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {}
+        if symbol.upper() == "ETHBTC":
+            # Binance pair directly
+            ser = _binance_klines("ETHBTC", limit=limit)
+            return SeriesWithSource(ser, "binance")
+        else:
+            ser = _binance_klines(symbol.upper(), limit=limit)
+            return SeriesWithSource(ser, "binance")
+    except Exception as e:
+        # Fallback: CoinGecko
+        if symbol.upper() == "ETHBTC":
+            eth = _cg_market_chart("ethereum", days=limit)
+            btc = _cg_market_chart("bitcoin", days=limit)
+            idx = eth.index.intersection(btc.index)
+            ratio = (eth.reindex(idx) / btc.reindex(idx)).dropna()
+            if ratio.empty:
+                raise RuntimeError(f"CoinGecko fallback failed for ETHBTC: no ratio")
+            return SeriesWithSource(ratio, "coingecko")
+        coin_id = _CG_ID.get(symbol.upper())
+        if not coin_id:
+            raise RuntimeError(f"No CoinGecko mapping for {symbol}")
+        ser = _cg_market_chart(coin_id, days=limit)
+        return SeriesWithSource(ser, "coingecko")
 
-def _fallback_factor(name: str, weight: int, reason: str) -> Dict[str, Any]:
-    """
-    اگر نت fetch شد: اول از state.json قبلی اگر موجود بود،
-    وگرنه یک مقدار میانه (۰.5 * weight) می‌دهیم تا کل مدل صفر نشود.
-    """
-    prev = _load_prev_state()
-    v = (prev.get("factors") or {}).get(name)
-    if isinstance(v, dict) and "score" in v and "ok" in v:
-        sc = float(v.get("score", 0.0))
-        ok = bool(v.get("ok", False))
-        ex = (v.get("explain") or "") + " | fallback: prev_state"
-        return {"score": max(0.0, min(sc, float(weight))), "ok": ok, "explain": ex}
-    # mid fallback
-    return {"score": 0.5 * float(weight), "ok": False, "explain": f"fallback_mid ({reason})"}
+# --------------------------- Factor scoring ---------------------------
 
-# ---------- Factors ----------
+def _trend_signals(ser: pd.Series, ema_short: int, ema_long: int) -> Tuple[float, float, float]:
+    ema_s = _ema(ser, ema_short)
+    ema_l = _ema(ser, ema_long)
+    rsi = _rsi(ser, 14).iloc[-1]
+    ratio = float((ema_s.iloc[-1] / ema_l.iloc[-1]) if ema_l.iloc[-1] else 1.0)
+    slope = _slope_pct(ser, window=min(50, len(ser)//3))
+    return ratio, rsi, slope
+
+def _trend_score_ok(
+    ser: pd.Series,
+    ema_short: int,
+    ema_long: int,
+    rsi_min: float,
+    slope_min: float = 0.0,
+) -> Tuple[float, bool, Dict[str, float]]:
+    ratio, rsi, slope = _trend_signals(ser, ema_short, ema_long)
+
+    # normalize → raw in [0,1]
+    ema_sig = _nznorm(ratio, 1.0, 1.2)        # 1.0 → 0, 1.2 → 1
+    rsi_sig = _nznorm(rsi, 50.0, 70.0)        # 50 → 0, 70 → 1
+    slp_sig = _nznorm(slope, slope_min, slope_min + 2.0)  # e.g. 0..2 %/day
+
+    raw = float(np.mean([ema_sig, rsi_sig, slp_sig]))
+    ok = (ratio > 1.0) and (rsi >= rsi_min) and (slope >= slope_min)
+
+    return raw, ok, {
+        "ratio": ratio,
+        "rsi": rsi,
+        "slope": slope,
+    }
+
+# --------------------------- Factors ---------------------------
+
 class FactorCalculator:
     """
-    Output per factor:
-    {
-      "score": float in [0..weight],
-      "ok": bool,
-      "explain": str
-    }
+    Computes all factors using Binance with CoinGecko fallback.
     """
-    def __init__(self):
-        self.weights = FACTOR_WEIGHTS
-        self.th = THRESHOLDS
 
-    def _btc_dominance(self) -> Dict[str, Any]:
-        weight = int(self.weights.get("btc_dominance", 0))
-        try:
-            df = _binance_klines("BTCUSDT", "1d", 220)
-            close = df["close"].dropna()
-            slope = _slope(close.pct_change().fillna(0).cumsum(), lookback=50)
-            dom_slope_min = float(self.th.get("DOM_SLOPE_MIN", -0.1))
+    def __init__(self, limit: int = 400):
+        self.limit = limit
 
-            if slope >= 0:
-                score, ok = 0.0, False
-            elif slope <= dom_slope_min:
-                score, ok = float(weight), True
-            else:
-                ratio = (0 - slope) / (0 - dom_slope_min)
-                score, ok = float(weight) * ratio, True
+    def _btc_dominance(self) -> Dict[str, object]:
+        """
+        از ETHBTC به‌عنوان نیابتی از کاهش دامیننس BTC استفاده می‌کنیم:
+        وقتی ETHBTC روند صعودی دارد (EMA50>EMA200, RSI>55, شیب>THRESHOLDS.DOM_SLOPE_MIN)،
+        یعنی احتمال کاهش دامیننس و فاز آلت‌ها بیشتر است → امتیاز بالاتر.
+        """
+        sws = _series("ETHBTC", limit=self.limit)
+        raw, ok, m = _trend_score_ok(
+            sws.close,
+            THRESHOLDS["ETHBTC_EMA_SHORT"],
+            THRESHOLDS["ETHBTC_EMA_LONG"],
+            THRESHOLDS["ETHBTC_RSI_MIN"],
+            THRESHOLDS["DOM_SLOPE_MIN"],
+        )
+        score = FACTOR_WEIGHTS["btc_dominance"] * raw
+        explain = (
+            f"src={sws.source} | ETHBTC ratio={m['ratio']:.3f}, RSI={m['rsi']:.1f}, slope%/d={m['slope']:.3f}"
+        )
+        return {"score": round(score, 2), "ok": bool(ok), "explain": explain}
 
-            dom_now = None
-            try:
-                cg = _coingecko_global()
-                dom_now = cg.get("market_cap_percentage", {}).get("btc")
-            except Exception:
-                pass
-            explain = f"slope:{slope:.4f}" + (f" | cg_btc_dominance:{dom_now:.2f}%" if dom_now else "")
-            return {"score": score, "ok": ok, "explain": explain}
-        except Exception as e:
-            return _fallback_factor("btc_dominance", weight, f"fetch_error:{type(e).__name__}")
+    def _eth_btc(self) -> Dict[str, object]:
+        sws = _series("ETHBTC", limit=self.limit)
+        raw, ok, m = _trend_score_ok(
+            sws.close,
+            THRESHOLDS["ETHBTC_EMA_SHORT"],
+            THRESHOLDS["ETHBTC_EMA_LONG"],
+            THRESHOLDS["ETHBTC_RSI_MIN"],
+            0.0,
+        )
+        score = FACTOR_WEIGHTS["eth_btc"] * raw
+        explain = (
+            f"src={sws.source} | ETHBTC ratio={m['ratio']:.3f}, RSI={m['rsi']:.1f}, slope%/d={m['slope']:.3f}"
+        )
+        return {"score": round(score, 2), "ok": bool(ok), "explain": explain}
 
-    def _eth_btc(self) -> Dict[str, Any]:
-        weight = int(self.weights.get("eth_btc", 0))
-        try:
-            df = _binance_klines("ETHBTC", "1d", 400)
-            close = df["close"].dropna()
-            rsi = float(_rsi(close, 14).iloc[-1])
-            rsimin = float(self.th.get("ETHBTC_RSI_MIN", 55))
+    def _total2(self) -> Dict[str, object]:
+        """
+        PROXY برای TOTAL2: روند ETHUSDT (نماینده آلتی با نقدینگی بالا).
+        """
+        sws = _series("ETHUSDT", limit=self.limit)
+        raw, ok, m = _trend_score_ok(
+            sws.close,
+            THRESHOLDS["TOTAL_EMA"],
+            THRESHOLDS["ETHBTC_EMA_LONG"],  # long=200
+            THRESHOLDS["TOTAL_RSI_MIN"],
+            0.0,
+        )
+        score = FACTOR_WEIGHTS["total2"] * raw
+        explain = f"src={sws.source} | ETHUSD ratio={m['ratio']:.3f}, RSI={m['rsi']:.1f}, slope%/d={m['slope']:.3f}"
+        return {"score": round(score, 2), "ok": bool(ok), "explain": explain}
 
-            base, ok_trend, _ = _score_trend_with_ema(
-                close,
-                short=int(self.th.get("ETHBTC_EMA_SHORT", 50)),
-                long=int(self.th.get("ETHBTC_EMA_LONG", 200)),
-                weight=weight,
-            )
-            ok_rsi = rsi >= rsimin
-            score = base * (1.0 if ok_rsi else 0.6)
-            ok = ok_trend and ok_rsi
-            explain = f"EMA({int(self.th.get('ETHBTC_EMA_SHORT', 50))}/{int(self.th.get('ETHBTC_EMA_LONG', 200))}), RSI:{rsi:.1f}"
-            return {"score": score, "ok": ok, "explain": explain}
-        except Exception as e:
-            return _fallback_factor("eth_btc", weight, f"fetch_error:{type(e).__name__}")
+    def _total3(self) -> Dict[str, object]:
+        """
+        PROXY برای TOTAL3: روند BNBUSDT (نماینده آلت‌های متوسط/کوین اکو‌سیستم).
+        """
+        sws = _series("BNBUSDT", limit=self.limit)
+        raw, ok, m = _trend_score_ok(
+            sws.close,
+            THRESHOLDS["TOTAL_EMA"],
+            THRESHOLDS["ETHBTC_EMA_LONG"],  # 200
+            THRESHOLDS["TOTAL_RSI_MIN"],
+            0.0,
+        )
+        # کمی سخت‌گیرتر: آلت‌های کوچک پرنوسان‌ترند → اندکی پنالتی روی raw
+        raw_adj = max(0.0, min(1.0, raw * 0.95))
+        score = FACTOR_WEIGHTS["total3"] * raw_adj
+        explain = f"src={sws.source} | BNBUSD ratio={m['ratio']:.3f}, RSI={m['rsi']:.1f}, slope%/d={m['slope']:.3f}"
+        return {"score": round(score, 2), "ok": bool(ok), "explain": explain}
 
-    def _total2(self) -> Dict[str, Any]:
-        weight = int(self.weights.get("total2", 0))
-        try:
-            # proxy: ETHUSDT
-            df = _binance_klines("ETHUSDT", "1d", 400)
-            close = df["close"].dropna()
-            rsi = float(_rsi(close, 14).iloc[-1])
-            rsimin = float(self.th.get("TOTAL_RSI_MIN", 55))
+    def _btc_regime(self) -> Dict[str, object]:
+        """
+        رژیم BTC: در آلت‌سیزن، معمولاً BTC رشد ملایم/خنثی دارد نه رکورددار مومنتوم.
+        معیار: EMA50>EMA200 اما RSI نه خیلی داغ (<=65) و شیب مثبت اما ملایم.
+        """
+        sws = _series("BTCUSDT", limit=self.limit)
+        ratio, rsi, slope = _trend_signals(sws.close, 50, 200)
 
-            base, ok_trend, _ = _score_trend_with_ema(
-                close, short=int(self.th.get("TOTAL_EMA", 50)), long=200, weight=weight
-            )
-            ok_rsi = rsi >= rsimin
-            score = base * (1.0 if ok_rsi else 0.7)
-            ok = ok_trend and ok_rsi
-            explain = f"EMA(50/200) proxy, RSI:{rsi:.1f}"
-            return {"score": score, "ok": ok, "explain": explain}
-        except Exception as e:
-            return _fallback_factor("total2", weight, f"fetch_error:{type(e).__name__}")
+        ok = (ratio > 1.0) and (50.0 <= rsi <= 65.0) and (slope >= 0.0)
+        # نمره: اگر خیلی داغ باشد، امتیاز کم می‌کنیم؛ اگر معتدل باشد، امتیاز خوب.
+        # raw از سه قطعه:
+        ema_sig = _nznorm(ratio, 1.0, 1.15)            # مثبت اما نه شدید
+        rsi_sig = 1.0 - _nznorm(rsi, 65.0, 75.0)       # هرچه RSI به 65 نزدیک‌تر بهتر (بالا بدتر)
+        slp_sig = _nznorm(slope, 0.0, 1.5)
+        raw = float(np.mean([ema_sig, rsi_sig, slp_sig]))
+        score = FACTOR_WEIGHTS["btc_regime"] * raw
 
-    def _total3(self) -> Dict[str, Any]:
-        weight = int(self.weights.get("total3", 0))
-        try:
-            # proxy: BNBUSDT
-            df = _binance_klines("BNBUSDT", "1d", 400)
-            close = df["close"].dropna()
-            rsi = float(_rsi(close, 14).iloc[-1])
+        explain = f"src={sws.source} | BTCUSD ratio={ratio:.3f}, RSI={rsi:.1f}, slope%/d={slope:.3f}"
+        return {"score": round(score, 2), "ok": bool(ok), "explain": explain}
 
-            base, ok_trend, _ = _score_trend_with_ema(close, short=50, long=200, weight=weight)
-            score = base * (1.0 if rsi >= 58 else 0.5)
-            ok = ok_trend and (rsi >= 58)
-            explain = f"EMA(50/200) proxy, RSI:{rsi:.1f}"
-            return {"score": score, "ok": ok, "explain": explain}
-        except Exception as e:
-            return _fallback_factor("total3", weight, f"fetch_error:{type(e).__name__}")
+    def _eth_trend(self) -> Dict[str, object]:
+        sws = _series("ETHUSDT", limit=self.limit)
+        raw, ok, m = _trend_score_ok(
+            sws.close,
+            THRESHOLDS["TOTAL_EMA"],     # 50
+            THRESHOLDS["ETHBTC_EMA_LONG"],  # 200
+            THRESHOLDS["TOTAL_RSI_MIN"], # 55
+            0.0,
+        )
+        score = FACTOR_WEIGHTS["eth_trend"] * raw
+        explain = f"src={sws.source} | ETHUSD ratio={m['ratio']:.3f}, RSI={m['rsi']:.1f}, slope%/d={m['slope']:.3f}"
+        return {"score": round(score, 2), "ok": bool(ok), "explain": explain}
 
-    def _btc_regime(self) -> Dict[str, Any]:
-        weight = int(self.weights.get("btc_regime", 0))
-        try:
-            df = _binance_klines("BTCUSDT", "1d", 220)
-            close = df["close"].dropna()
-            sl = _slope(close.pct_change().fillna(0).rolling(2).mean(), lookback=50)
-            if sl <= 0:
-                score, ok = float(weight), True
-            elif sl >= 0.002:
-                score, ok = 0.0, False
-            else:
-                ratio = (0.002 - sl) / 0.002
-                score, ok = float(weight) * ratio, True
-            explain = f"slope(returns,50):{sl:.5f}"
-            return {"score": score, "ok": ok, "explain": explain}
-        except Exception as e:
-            return _fallback_factor("btc_regime", weight, f"fetch_error:{type(e).__name__}")
+    # --------------------------- public ---------------------------
 
-    def _eth_trend(self) -> Dict[str, Any]:
-        weight = int(self.weights.get("eth_trend", 0))
-        try:
-            df = _binance_klines("ETHUSDT", "1d", 400)
-            close = df["close"].dropna()
-            base, ok_trend, _ = _score_trend_with_ema(close, short=50, long=200, weight=weight)
-            rsi = float(_rsi(close, 14).iloc[-1])
-            boost = 1.1 if rsi >= 60 else 1.0
-            score = min(float(weight), base * boost)
-            ok = ok_trend and (rsi >= 52)
-            explain = f"EMA(50/200), RSI:{rsi:.1f}"
-            return {"score": score, "ok": ok, "explain": explain}
-        except Exception as e:
-            return _fallback_factor("eth_trend", weight, f"fetch_error:{type(e).__name__}")
-
-    def compute_factors(self) -> Dict[str, Dict[str, Any]]:
-        out: Dict[str, Dict[str, Any]] = {}
-        for name, fn in [
-            ("btc_dominance", self._btc_dominance),
-            ("eth_btc",       self._eth_btc),
-            ("total2",        self._total2),
-            ("total3",        self._total3),
-            ("btc_regime",    self._btc_regime),
-            ("eth_trend",     self._eth_trend),
-        ]:
-            try:
-                out[name] = fn()
-            except Exception as e:
-                # آخرین خط دفاع: اگر حتی فال‌بک هم خطا داد
-                w = int(self.weights.get(name, 0))
-                out[name] = {"score": 0.5 * float(w), "ok": False, "explain": f"hard-fallback:{type(e).__name__}"}
+    def compute_factors(self) -> Dict[str, Dict[str, object]]:
+        """
+        محاسبه همه فاکتورها با فول‌بک واقعی.
+        """
+        out: Dict[str, Dict[str, object]] = {}
+        out["btc_dominance"] = self._btc_dominance()
+        out["eth_btc"] = self._eth_btc()
+        out["total2"] = self._total2()
+        out["total3"] = self._total3()
+        out["btc_regime"] = self._btc_regime()
+        out["eth_trend"] = self._eth_trend()
         return out
