@@ -4,170 +4,242 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Tuple
+
+from altseason.config import FACTOR_WEIGHTS, THRESHOLDS
+
+ROOT = Path(__file__).resolve().parents[2]
+REPORTS_DIR = ROOT / "reports"
+STATE_PATH = REPORTS_DIR / "state.json"
+
+log = logging.getLogger("altseason")
 
 
-@dataclass
-class FactorResult:
-    score: int
-    ok: bool
-    explain: Optional[str] = None
+# ========== تنظیمات قابل‌تغییر با ENV ==========
+def _penalty_factor() -> float:
+    """ضریب پنالتی برای فاکتورهای ok=False در جمع وزنی."""
+    try:
+        return float(os.getenv("ALT_PENALTY", "0.85"))
+    except Exception:
+        return 0.85
+
+def _use_penalty() -> bool:
+    return str(os.getenv("ALT_PENALTY_ENABLE", "1")).lower() in ("1", "true", "yes", "y")
+
+# ==============================================
+
+
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def _normalize_to_weight(key: str, fval: Dict[str, Any]) -> float:
+    """
+    نرمال‌سازی امتیاز هر فاکتور به بازه [0, weight]:
+      - اگر score_raw و score_max موجود باشد: score = (raw / max) * weight
+      - در غیر اینصورت اگر score موجود باشد:
+          * اگر score <= weight → همان score
+          * اگر score > weight → min(score, weight) برای جلوگیری از تورم
+      - اگر هیچ‌کدام نبود: 0
+    """
+    w = float(FACTOR_WEIGHTS.get(key, 0))
+    if w <= 0:
+        return 0.0
+
+    raw = fval.get("score_raw", None)
+    raw_max = fval.get("score_max", None)
+    if raw is not None and raw_max:
+        try:
+            raw = float(raw)
+            raw_max = float(raw_max)
+            if raw_max > 0:
+                return max(0.0, min((raw / raw_max) * w, w))
+        except Exception:
+            pass
+
+    sc = fval.get("score", None)
+    if sc is None:
+        return 0.0
+
+    try:
+        sc = float(sc)
+    except Exception:
+        return 0.0
+
+    if sc <= w:
+        return max(0.0, sc)
+    # اگر مقیاس قدیمی بوده و بزرگ‌تر از وزن است، برای بی‌خطر بودن کَپ می‌کنیم
+    return w
+
+
+def _weighted_total_and_okcount(factors: Dict[str, Dict[str, Any]]) -> Tuple[int, int]:
+    """
+    جمع وزنیِ نرمال‌شده با پنالتی ملایم برای ok=False (اختیاری).
+    """
+    total_weight = sum(float(v) for v in FACTOR_WEIGHTS.values())
+    if total_weight <= 0:
+        return 0, 0
+
+    penalty = _penalty_factor() if _use_penalty() else 1.0
+
+    total = 0.0
+    ok_count = 0
+    for key, fval in factors.items():
+        w = float(FACTOR_WEIGHTS.get(key, 0))
+        if w <= 0:
+            continue
+
+        base = _normalize_to_weight(key, fval)  # [0..w]
+        if not base:
+            # اگر امتیاز این فاکتور نداشتیم، صرفاً 0
+            continue
+
+        is_ok = bool(fval.get("ok"))
+        if is_ok:
+            ok_count += 1
+            total += base
+        else:
+            total += base * penalty
+
+    # به نزدیک‌ترین عدد صحیح
+    return int(round(total)), ok_count
+
+
+def _classify(total_score: int, ok_count: int) -> Tuple[str, bool]:
+    """
+    وضعیت نهایی با استفاده از آستانه‌ها + حداقل تعداد فاکتورهای OK.
+    """
+    min_factors = _safe_int(THRESHOLDS.get("ALTSEASON_MIN_FACTORS", 4), 4)
+    forming_min = _safe_int(THRESHOLDS.get("FORMING_MIN", 60), 60)
+    neutral_min = _safe_int(THRESHOLDS.get("NEUTRAL_MIN", 45), 45)
+    altseason_min = _safe_int(THRESHOLDS.get("ALTSEASON_MIN_SCORE", 75), 75)
+
+    # Altseason Likely: هم امتیاز بالا هم حداقل تعداد فاکتور OK
+    if total_score >= altseason_min and ok_count >= min_factors:
+        return "Altseason Likely", True
+
+    # Forming / Watch: امتیاز بالا ولی به حداقل OKها نرسیده
+    if total_score >= forming_min:
+        return "Forming / Watch", True
+
+    if total_score >= neutral_min:
+        return "Neutral", False
+
+    return "Risk-Off", False
+
+
+def _write_json(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _write_markdown_report(report_dir: Path, state: Dict[str, Any]) -> Path:
+    ts = datetime.now(UTC)
+    name = ts.strftime("%Y-%m-%d") + ".md"
+    path = report_dir / name
+
+    lines = []
+    lines.append(f"# Altseason Radar — Daily Report ({ts.date()})")
+    lines.append("")
+    lines.append(f"- **Total Score:** {state.get('total_score', 'N/A')}/100")
+    lines.append(f"- **Status:** {state.get('status', 'Unknown')}")
+    lines.append(f"- **Generated:** {ts.isoformat()}")
+    lines.append("")
+
+    facs = state.get("factors") or {}
+    if facs:
+        lines.append("## Factors")
+        for k, v in facs.items():
+            w = FACTOR_WEIGHTS.get(k, 0)
+            base = _normalize_to_weight(k, v)
+            is_ok = "✅" if v.get("ok") else "❌"
+            explain = v.get("explain") or ""
+            lines.append(
+                f"- **{k}** (w={w}): {base:.0f} {is_ok}"
+                + (f" — {explain}" if explain else "")
+            )
+
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
 
 
 class AltseasonRunner:
     """
-    Runs the daily Altseason analysis and persists results for downstream consumers.
-
-    Responsibilities:
-      - simulate/compute factors (you can later swap _compute_factors with real logic)
-      - compute total score and status
-      - write a machine-readable state.json for scripts/run_daily.py
-      - write a human-readable daily markdown report under reports/
+    Runner جدید با:
+      - جمع وزنی نرمال‌شده + پنالتی ملایم
+      - enforce حداقل فاکتورهای OK در کلاس‌بندی
+      - تحمل دادهٔ ناقص
+      - سازگاری کامل با خروجی state.json + گزارش md
     """
 
-    def __init__(self, logger: Optional[logging.Logger] = None) -> None:
-        self.logger = logger or logging.getLogger("altseason")
-        self.logger.setLevel(logging.INFO)
+    def __init__(self, reports_dir: Path | None = None):
+        self.logger = logging.getLogger("altseason")
+        self.reports_dir = Path(reports_dir) if reports_dir else REPORTS_DIR
 
-        # allow override via env (useful in CI)
-        reports_dir_env = os.getenv("REPORTS_DIR", "").strip()
-        self.reports_dir = Path(reports_dir_env) if reports_dir_env else Path.cwd() / "reports"
-        self.reports_dir.mkdir(parents=True, exist_ok=True)
-
-    # -------------------- public API --------------------
-
-    def run_daily_analysis(self) -> bool:
-        """Main entrypoint used by scripts/run_daily.py. Returns True on success."""
-        print("🔄 Starting altseason analysis...")
-
-        try:
-            print("📡 Fetching market data...")
-            # TODO: plug real providers here
-
-            print("📈 Calculating market factors...")
-            factors = self._compute_factors()
-
-            total_score = sum(v["score"] for v in factors.values())
-            status, forming = self._status_from_score(total_score)
-
-            print(f"📊 Total Score: {total_score}/100")
-            print(f"🎯 Status: {status}")
-            print("✅ Analysis completed successfully!")
-
-            # persist artifacts for other steps (telegram etc.)
-            self._write_state_json(
-                total_score=total_score,
-                status=status,
-                forming=forming,
-                factors=factors,
-            )
-            self._write_daily_markdown(
-                total_score=total_score,
-                status=status,
-                forming=forming,
-                factors=factors,
-            )
-
-            return True
-
-        except Exception as e:
-            self.logger.exception("Daily analysis failed: %s", e)
-            print("❌ Analysis failed")
-            return False
-
-    # -------------------- internals --------------------
-
+    # اگر کلاس/پایپ‌لاین واقعی داری، همین امضا را نگه دار و خروجی را در همین قالب بده.
     def _compute_factors(self) -> Dict[str, Dict[str, Any]]:
         """
-        Simulated factors. Replace with real logic and real scoring later.
-        Keep keys & structure stable (used in reports/state.json and Markdown).
-        """
-        simulated: Dict[str, FactorResult] = {
-            "btc_dominance": FactorResult(score=15, ok=True,  explain="Dominance below falling MA"),
-            "eth_btc":       FactorResult(score=18, ok=True,  explain="ETH/BTC trending up"),
-            "total2":        FactorResult(score=12, ok=True,  explain="TOTAL2 above EMA"),
-            "total3":        FactorResult(score=10, ok=False, explain="TOTAL3 momentum mixed"),
-            "btc_regime":    FactorResult(score= 8, ok=False, explain="BTC in range-bound regime"),
-            "eth_trend":     FactorResult(score=11, ok=True,  explain="ETH in constructive trend"),
-        }
-        # convert dataclasses to dicts
-        return {k: {"score": v.score, "ok": v.ok, "explain": v.explain} for k, v in simulated.items()}
-
-    @staticmethod
-    def _status_from_score(total_score: int) -> tuple[str, bool]:
-        """
-        Business rules for mapping total score → status.
-        Returns (status_label, forming_bool)
-        """
-        if total_score >= 75:
-            return "Altseason Likely 🟢", True
-        if total_score >= 60:
-            return "Forming / Watch 🟡", True
-        if total_score >= 45:
-            return "Neutral ⚪️", False
-        return "Risk-Off 🔴", False
-
-    def _write_state_json(self, *, total_score: int, status: str, forming: bool, factors: Dict[str, Any]) -> None:
-        """
-        Writes a compact machine-readable file for the notifier/script.
-        Path: reports/state.json
-        Schema:
+        در تولید، این متد باید با دادهٔ واقعی پر شود.
+        ساختار هر فاکتور:
           {
-            "total_score": int,
-            "status": str,
-            "forming": bool,
-            "as_of": ISO-8601 UTC,
-            "factors": { <factor>: {"score": int, "ok": bool, "explain": str|None}, ... }
+            "score": int | float             # (اختیاری) اگر از قدیم در مقیاس وزن بود
+            "score_raw": float               # (اختیاری) مقدار خام
+            "score_max": float               # (اختیاری) بیشینهٔ مقدار خام
+            "ok": bool,
+            "explain": str
           }
+        - اگر score_raw/score_max بدهی، به صورت خودکار به weight آن فاکتور نرمال می‌شود.
+        - اگر فقط score بدهی و <= weight باشد، همان استفاده می‌شود (سازگار با کد فعلی).
         """
-        payload = {
-            "total_score": int(total_score),
-            "status": str(status),
-            "forming": bool(forming),
-            "as_of": datetime.now(timezone.utc).isoformat(),
-            "factors": factors,
+        # نمونهٔ فعلی شما (سازگار با قبل):
+        return {
+            "btc_dominance": {"score": 15, "ok": True,  "explain": "Dominance زیر EMA-ها"},
+            "eth_btc":       {"score": 18, "ok": True,  "explain": "ETH/BTC بالای EMA50"},
+            "total2":        {"score": 12, "ok": True,  "explain": "TOTAL2 روند مثبت"},
+            "total3":        {"score": 10, "ok": False, "explain": "TOTAL3 ضعف آلت‌های کوچک"},
+            "btc_regime":    {"score": 8,  "ok": False, "explain": "ریسک رِژیم BTC"},
+            "eth_trend":     {"score": 11, "ok": True,  "explain": "ETH روند صعودی سبک"},
         }
-        out = self.reports_dir / "state.json"
-        out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.logger.info("Wrote %s", out)
 
-    def _write_daily_markdown(self, *, total_score: int, status: str, forming: bool, factors: Dict[str, Any]) -> None:
-        """
-        Writes a human-friendly markdown report the same day.
-        Path: reports/YYYY-MM-DD.md  (UTC date)
-        Includes 'Score:' و 'Status:' خطوطی که پارسر تلگرام به‌راحتی می‌خوانَد.
-        """
-        now_utc = datetime.now(timezone.utc)
-        date_str = now_utc.date().isoformat()
-        md_path = self.reports_dir / f"{date_str}.md"
+    def run_daily_analysis(self) -> bool:
+        print("🔄 Starting altseason analysis...")
+        print("📡 Fetching market data...")
+        print("📈 Calculating market factors...")
 
-        # simple table of factors
-        lines = [
-            f"# Altseason Radar — {date_str}",
-            "",
-            f"**Score:** {total_score}/100",
-            f"**Status:** {status}",
-            f"**Generated (UTC):** {now_utc.isoformat()}",
-            "",
-            "## Factors",
-            "",
-            "| Factor | Score | OK | Explain |",
-            "|-------:|------:|:--:|:--------|",
-        ]
-        for name, d in factors.items():
-            ok_emoji = "✅" if d.get("ok") else "❌"
-            lines.append(f"| `{name}` | {d.get('score', '')} | {ok_emoji} | {d.get('explain') or ''} |")
+        # 1) محاسبهٔ فاکتورها
+        factors = self._compute_factors()
 
-        # tiny TL;DR
-        tldr = "Forming" if forming else "Not forming"
-        lines += [
-            "",
-            f"**TL;DR:** {tldr}.",
-            "",
-        ]
+        # 2) جمع وزنی نرمال‌شده + پنالتی
+        total_score, ok_count = _weighted_total_and_okcount(factors)
 
-        md_path.write_text("\n".join(lines), encoding="utf-8")
-        self.logger.info("Wrote %s", md_path)
+        # 3) وضعیت نهایی با درنظرگرفتن حداقل فاکتورهای OK
+        status, forming = _classify(total_score, ok_count)
+
+        # 4) گزارش کنسولی
+        badge = "🟢" if forming and status.startswith("Altseason") else \
+                "🟡" if forming else \
+                "⚪️" if status.startswith("Neutral") else "🔴"
+        print(f"📊 Total Score: {total_score}/100")
+        print(f"🎯 Status: {status} {badge}")
+        print("✅ Analysis completed successfully!")
+
+        # 5) ذخیرهٔ state.json
+        state = {
+            "total_score": total_score,
+            "status": status,
+            "forming": bool(forming),
+            "as_of": datetime.now(UTC).isoformat(),
+            "factors": factors,
+            "ok_count": ok_count,
+        }
+        _write_json(STATE_PATH, state)
+
+        # 6) ذخیرهٔ گزارش مارک‌داون روز
+        _ = _write_markdown_report(self.reports_dir, state)
+
+        return True
