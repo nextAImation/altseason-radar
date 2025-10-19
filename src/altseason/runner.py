@@ -10,13 +10,11 @@ from datetime import datetime, UTC
 from altseason.config import FACTOR_WEIGHTS, THRESHOLDS
 from altseason.factors import FactorCalculator
 
-# مسیرها
 _THIS = Path(__file__).resolve()
-ROOT = _THIS.parents[2]  # repo root
+ROOT = _THIS.parents[2]
 REPORTS_DIR = ROOT / "reports"
 STATE_PATH = REPORTS_DIR / "state.json"
 
-# -------------------- Utilities --------------------
 def _write_json(path: Path, obj: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -27,12 +25,13 @@ def _write_markdown_report(reports_dir: Path, state: Dict[str, Any]) -> Path:
     date_str = datetime.now(UTC).date().isoformat()
     md_path = reports_dir / f"{date_str}.md"
 
-    score = state.get("total_score", "N/A")
-    status = state.get("status", "Unknown")
+    score   = state.get("total_score", "N/A")
+    status  = state.get("status", "Unknown")
     forming = "Yes" if state.get("forming") else "No"
-    as_of = state.get("as_of", "")
+    as_of   = state.get("as_of", "")
+    okc     = state.get("ok_count")
+    conf    = state.get("confidence")
 
-    # سازگار با پارسر: خطوط Score/Status ساده و واضح
     lines = [
         f"# Altseason Radar — {date_str}",
         "",
@@ -40,9 +39,15 @@ def _write_markdown_report(reports_dir: Path, state: Dict[str, Any]) -> Path:
         f"**Status:** {status}",
         f"**Forming:** {forming}",
         f"**Generated:** {as_of}",
-        "",
-        "## Factors",
     ]
+    if okc is not None or conf is not None:
+        diag = []
+        if okc is not None:  diag.append(f"**OK Factors:** {okc}")
+        if conf is not None: diag.append(f"**Confidence:** {conf:.3f}")
+        lines.append("")
+        lines.append(" | ".join(diag))
+
+    lines += ["", "## Factors"]
     factors: Dict[str, Any] = state.get("factors", {})
     for k, v in factors.items():
         sc = v.get("score", 0)
@@ -63,10 +68,6 @@ def _penalty_factor() -> float:
         return 0.85
 
 def _normalize_to_weight(name: str, v: Dict[str, Any]) -> float:
-    """
-    اگر score_raw/score_max موجود بود → به وزن map می‌کنیم؛
-    در غیر اینصورت از v['score'] (کپ به weight) استفاده می‌کنیم.
-    """
     w = float(FACTOR_WEIGHTS.get(name, 0))
     if w <= 0:
         return 0.0
@@ -77,7 +78,6 @@ def _normalize_to_weight(name: str, v: Dict[str, Any]) -> float:
             return max(0.0, min((raw / mx) * w, w))
         except Exception:
             return 0.0
-    # fallback
     try:
         sc = float(v.get("score", 0.0))
         return max(0.0, min(sc, w))
@@ -85,11 +85,6 @@ def _normalize_to_weight(name: str, v: Dict[str, Any]) -> float:
         return 0.0
 
 def _weighted_total_and_okcount(factors: Dict[str, Dict[str, Any]]) -> Tuple[int, int, float]:
-    """
-    خروجی: (total_score 0..100, ok_count, confidence 0..1)
-    - total_score = (sum(normalized scores) / sum(weights)) * 100
-    - confidence  = sum(normalized scores) / sum(weights)
-    """
     sum_w = float(sum(FACTOR_WEIGHTS.values()))
     if sum_w <= 0:
         return 0, 0, 0.0
@@ -99,7 +94,7 @@ def _weighted_total_and_okcount(factors: Dict[str, Dict[str, Any]]) -> Tuple[int
     total_raw = 0.0
     ok_count = 0
     for k, v in factors.items():
-        base = _normalize_to_weight(k, v)  # [0..weight_k]
+        base = _normalize_to_weight(k, v)
         if base <= 0:
             continue
         if bool(v.get("ok")):
@@ -113,9 +108,6 @@ def _weighted_total_and_okcount(factors: Dict[str, Dict[str, Any]]) -> Tuple[int
     return total_score, ok_count, confidence
 
 def _classify(total_score: int, ok_count: int) -> Tuple[str, bool]:
-    """
-    ترکیب امتیاز و تعداد فاکتورهای OK برای کاهش false-positive.
-    """
     min_ok = int(THRESHOLDS.get("ALTSEASON_MIN_FACTORS", 4))
     if total_score >= int(THRESHOLDS.get("ALTSEASON_MIN_SCORE", 75)) and ok_count >= min_ok:
         return "Altseason Likely", True
@@ -125,14 +117,12 @@ def _classify(total_score: int, ok_count: int) -> Tuple[str, bool]:
         return "Neutral", False
     return "Risk-Off", False
 
-# -------------------- Runner --------------------
 class AltseasonRunner:
     def __init__(self, reports_dir: str | Path | None = None, state_path: str | Path | None = None):
         self.reports_dir = Path(reports_dir) if reports_dir else REPORTS_DIR
-        self.state_path = Path(state_path) if state_path else STATE_PATH
+        self.state_path  = Path(state_path)  if state_path  else STATE_PATH
         self.reports_dir.mkdir(parents=True, exist_ok=True)
 
-    # محاسبه واقعی فاکتورها
     def _compute_factors(self) -> Dict[str, Dict[str, Any]]:
         calc = FactorCalculator()
         return calc.compute_factors()
